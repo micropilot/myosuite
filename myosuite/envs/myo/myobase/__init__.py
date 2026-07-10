@@ -53,6 +53,40 @@ curr_dir = os.path.dirname(os.path.abspath(__file__))
 
 print("MyoSuite:> Registering Myo Envs")
 
+# QWERTY keyboard typing ===========================
+register_env_with_variants(
+    id="myoHandKeyPress-v0",
+    entry_point="myosuite.envs.myo.myobase.keyboard_v0:KeyboardEnvV0",
+    max_episode_steps=150,
+    kwargs={
+        "model_path": curr_dir + "/../assets/hand/myohand_keyboard.xml",
+        # right/center keys reachable by a single right MyoHand (see
+        # KeyboardEnvV0.RIGHT_HAND_KEYS); pass None for the full keyboard.
+        "target_keys": [
+            "6", "7", "8", "9", "0",
+            "y", "u", "i", "o", "p",
+            "h", "j", "k", "l", "semicolon",
+            "n", "m", "comma", "period",
+            "space",
+        ],
+        "normalize_act": True,
+        "frame_skip": 10,
+    },
+)
+
+# Bimanual (right + mirrored left MyoHand): whole keyboard reachable.
+register_env_with_variants(
+    id="myoBimanualKeyPress-v0",
+    entry_point="myosuite.envs.myo.myobase.keyboard_v0:BimanualKeyboardEnvV0",
+    max_episode_steps=150,
+    kwargs={
+        "model_path": curr_dir + "/../assets/hand/myohand_keyboard_bimanual.xml",
+        "target_keys": None,   # full keyboard (both hands cover it)
+        "normalize_act": True,
+        "frame_skip": 10,
+    },
+)
+
 # Finger-tip reaching ==============================
 register_env_with_variants(
     id="motorFingerReachFixed-v0",
