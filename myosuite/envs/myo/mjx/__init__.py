@@ -8,6 +8,7 @@ from mujoco_playground._src import mjx_env
 
 from myosuite.envs.myo.mjx.playground_pose_v0 import MjxPoseEnvV0
 from myosuite.envs.myo.mjx.playground_reach_v0 import MjxReachEnvV0
+from myosuite.envs.myo.mjx.playground_keyboard_v0 import MjxKeyboardEnvV0
 
 base_config = config_dict.create(
     ctrl_dt=0.02,
@@ -39,6 +40,146 @@ reach_env_config = config_dict.ConfigDict({**base_config, **config_dict.create(
     target_reach_range=config_dict.ConfigDict(),
     far_th=0.35,
 )})
+
+keyboard_env_config = config_dict.ConfigDict({**base_config, **config_dict.create(
+    # single-key press task (milestone 1). Small right-hand board.
+    num_envs=2_048,
+    max_episode_steps=100,
+    press_th=0.6,          # fraction of key travel counted as "pressed"
+    release_th=0.2,        # travel below which a key counts as released (debounce)
+    reach_th=0.015,        # fingertip-key distance counted as "on key" (m)
+    far_th=0.30,           # episode-fail distance (m)
+    sequence_length=1,     # 1 -> single-key hold; >1 -> type a key sequence in order
+    base_init_noise=0.15,  # randomize the hand start over [-1,1]*noise*half-range
+    pronate=1.4,           # forearm pronation (palm down)
+    knuckle_arch=0.15,     # MCP flexion so fingers arch downward
+    finger_spread=0.3,     # MCP abduction to fan fingers across columns
+    hover_z=0.03,          # base_z init so fingertips hover above keys
+    home_offset=(0.04, 0.04),  # (dx,dy) base shift so fingers rest on keys
+    wrist_stiffness=8.0,   # passive stiffness holding the wrist pose
+    naconmax_per_env=48,   # contact-buffer budget/env (broadphase candidates, pre-filter)
+    target_keys=(),        # () -> every key on the board is targetable
+    obs_released_seen=False,  # P5: expose the debounced release latch in the obs
+    # human muscle-synergy action space (Task 1). When synergy=True the policy
+    # acts in K human-synergy latents per hand (decoded to muscle activations by
+    # a FIXED linear map) + the base servos, instead of raw per-muscle commands.
+    synergy=False,
+    synergy_k=12,
+    synergy_span=4.0,
+    synergy_basis_path="",         # set below to synergy_basis_right.npz
+    synergy_decoder_path="",       # if set: generative MLP decoder g(z)->act (not linear)
+    synergy_participant="",         # per-participant npz: which participant id key
+    synergy_scale_template="",     # human template used for the latent scale
+    muscle_template_path_left="",  # left-hand template (bimanual muscle_match)
+    reward_config=config_dict.create(
+        reach_weight=1.5,
+        press_weight=5.0,
+        bonus_weight=3.0,
+        home_weight=1.0,
+        act_reg_weight=1.0,
+        penalty_weight=10.0,
+        keystroke_weight=5.0,   # sparse bonus per completed keystroke (seq mode)
+    ),
+)})
+model_path = "envs/myo/assets/hand/"
+model_filename = "myohand_keyboard_mini.xml"
+keyboard_env_config["model_path"] = (
+    epath.Path(epath.resource_path("myosuite")) / model_path / model_filename
+)
+# repo root (emg2qwerty_myo/) for the How-We-Type datasets.
+_repo_root = epath.Path(__file__).parent.parent.parent.parent.parent.parent
+_synergy_basis = (_repo_root / "datasets/how_we_type/synergy_basis_right.npz").as_posix()
+_muscle_tmpl_r = (_repo_root / "datasets/how_we_type/muscle_template_right.npz").as_posix()
+_muscle_tmpl_l = (_repo_root / "datasets/how_we_type/muscle_template_left.npz").as_posix()
+keyboard_env_config["synergy_basis_path"] = _synergy_basis
+keyboard_env_config["synergy_scale_template"] = _muscle_tmpl_r
+
+# Sequence typing task (milestone 2): type a short key sequence in order, each a
+# debounced keystroke (press-after-release), episode ends on word completion.
+keyboard_seq_config = copy.deepcopy(keyboard_env_config)
+keyboard_seq_config["sequence_length"] = 4
+keyboard_seq_config["max_episode_steps"] = 180   # room to hit 4 keys / word
+keyboard_seq_config["num_envs"] = 1_024
+
+# Right-hand-reachable keys (sanitized names) for the single-hand FULL board.
+_RIGHT_HAND_KEYS = (
+    "6", "7", "8", "9", "0", "y", "u", "i", "o", "p",
+    "h", "j", "k", "l", "semicolon", "n", "m", "comma", "period", "space",
+)
+
+# FULL 61-key board, single right hand (milestone 2b). Same scene as the CPU env;
+# touch sensors are stripped at load. Only the right-reachable keys are targeted.
+keyboard_full_config = copy.deepcopy(keyboard_env_config)
+keyboard_full_config["target_keys"] = _RIGHT_HAND_KEYS
+keyboard_full_config["num_envs"] = 1_024
+keyboard_full_config["naconmax_per_env"] = 64
+keyboard_full_config["model_path"] = (
+    epath.Path(epath.resource_path("myosuite")) / model_path / "myohand_keyboard.xml"
+)
+
+# MUSCLE-TEMPLATE imitation (milestone 2c): full right-hand board, but the reward
+# adds a term pulling the current target key's muscle activation toward the human
+# per-key template (datasets/how_we_type/muscle_template_right.npz), gated to keys
+# with >= template_min_count human presses. Verifies a GPU typist still types AND
+# its muscle activations become more human-like (the CPU A/B: +57% similarity).
+keyboard_template_config = copy.deepcopy(keyboard_full_config)
+keyboard_template_config["muscle_template_path"] = _muscle_tmpl_r
+keyboard_template_config["template_min_count"] = 50
+keyboard_template_config["reward_config"]["muscle_match_weight"] = 0.5
+
+# A/B baseline: SAME board + template loaded (so muscle_match is measured) but
+# reward weight 0 (no shaping) -> the "types normally, human-dissimilar" control.
+keyboard_template_base_config = copy.deepcopy(keyboard_template_config)
+keyboard_template_base_config["reward_config"]["muscle_match_weight"] = 0.0
+
+# Stronger-weight variant: on GPU (brax PPO, large returns) weight 0.5 is only
+# ~2% of the return and gets washed out; weight 2.0 makes the human-template pull
+# a visible fraction of the reward -> muscle_match rises with typing preserved.
+keyboard_template_hi_config = copy.deepcopy(keyboard_template_config)
+keyboard_template_hi_config["reward_config"]["muscle_match_weight"] = 2.0
+
+# BIMANUAL full board (milestone 2b): two MyoHands (78 muscles, 10 fingertips);
+# with both hands the whole keyboard is reachable so every key is targetable.
+keyboard_bimanual_config = copy.deepcopy(keyboard_env_config)
+keyboard_bimanual_config["target_keys"] = ()
+keyboard_bimanual_config["num_envs"] = 512
+keyboard_bimanual_config["naconmax_per_env"] = 110
+keyboard_bimanual_config["model_path"] = (
+    epath.Path(epath.resource_path("myosuite")) / model_path / "myohand_keyboard_bimanual.xml"
+)
+
+# ============================ Task 1: SYNERGY action space =====================
+# Full right-hand board with the K=12 human muscle-synergy action space. The
+# template is loaded (weight 0) so `muscle_match` (human-similarity) is MEASURED
+# -> this is the "raw synergy" A/B arm vs raw-muscle (MjxKeyboardTemplateBase-v0).
+keyboard_synergy_config = copy.deepcopy(keyboard_template_base_config)  # full board, w=0
+keyboard_synergy_config["synergy"] = True
+keyboard_synergy_config["synergy_k"] = 12
+
+# Synergy action space + template regularizer (weight 2.0): the third A/B arm.
+keyboard_synergy_hi_config = copy.deepcopy(keyboard_synergy_config)
+keyboard_synergy_hi_config["reward_config"]["muscle_match_weight"] = 2.0
+
+# ================= Task 2: BIMANUAL human-muscle imitation =====================
+# Bimanual board + stacked right(39)+left(39)=78 muscle template, muscle_match
+# reward weight 2.0. Each key is matched on the 39 muscles of its pressing hand.
+keyboard_bimanual_template_config = copy.deepcopy(keyboard_bimanual_config)
+keyboard_bimanual_template_config["muscle_template_path"] = _muscle_tmpl_r
+keyboard_bimanual_template_config["muscle_template_path_left"] = _muscle_tmpl_l
+keyboard_bimanual_template_config["synergy_scale_template"] = _muscle_tmpl_r
+keyboard_bimanual_template_config["template_min_count"] = 50
+keyboard_bimanual_template_config["reward_config"]["muscle_match_weight"] = 2.0
+
+# A/B baseline for the bimanual imitation: template loaded (muscle_match measured)
+# but reward weight 0 (no shaping).
+keyboard_bimanual_template_base_config = copy.deepcopy(keyboard_bimanual_template_config)
+keyboard_bimanual_template_base_config["reward_config"]["muscle_match_weight"] = 0.0
+
+# FLAGSHIP: bimanual muscle-template imitation IN the human-synergy action space
+# (per-hand K=12 basis applied block-wise -> 24 latents + 6 base = 30-D action).
+keyboard_bimanual_synergy_config = copy.deepcopy(keyboard_bimanual_template_config)
+keyboard_bimanual_synergy_config["synergy"] = True
+keyboard_bimanual_synergy_config["synergy_k"] = 12
 
 ppo_config = config_dict.create(
     num_timesteps=50_000_000,
@@ -201,6 +342,39 @@ def make(env_name: str, config_overrides=None) -> mjx_env.MjxEnv:
 
         return env
 
+    if "MjxKeyboard" in env_name_base:
+        # NOTE: order matters (substring match) -> most specific names first.
+        if "BimanualSynergy" in env_name_base:
+            cfg = keyboard_bimanual_synergy_config
+        elif "BimanualTemplateBase" in env_name_base:
+            cfg = keyboard_bimanual_template_base_config
+        elif "BimanualTemplate" in env_name_base:
+            cfg = keyboard_bimanual_template_config
+        elif "Bimanual" in env_name_base:
+            cfg = keyboard_bimanual_config
+        elif "SynergyHi" in env_name_base:
+            cfg = keyboard_synergy_hi_config
+        elif "Synergy" in env_name_base:
+            cfg = keyboard_synergy_config
+        elif "TemplateBase" in env_name_base:
+            cfg = keyboard_template_base_config
+        elif "TemplateHi" in env_name_base:
+            cfg = keyboard_template_hi_config
+        elif "Template" in env_name_base:
+            cfg = keyboard_template_config
+        elif "Full" in env_name_base:
+            cfg = keyboard_full_config
+        elif "TypeSeq" in env_name_base:
+            cfg = keyboard_seq_config
+        else:
+            cfg = keyboard_env_config
+        registry.register_environment_with_variants(
+            env_name_base, MjxKeyboardEnvV0, config_callable(cfg)
+        )
+        env = registry.load(env_name, config_overrides=config_overrides)
+
+        return env
+
 
 env_names = [
     "MjxElbowPoseFixed-v0",
@@ -209,4 +383,16 @@ env_names = [
     "MjxFingerPoseRandom-v0",
     "MjxHandReachRandom-v0",
     "MjxHandReachFixed-v0",
+    "MjxKeyboardKeyPress-v0",
+    "MjxKeyboardTypeSeq-v0",
+    "MjxKeyboardFullKeyPress-v0",
+    "MjxKeyboardBimanual-v0",
+    "MjxKeyboardTemplate-v0",
+    "MjxKeyboardTemplateBase-v0",
+    "MjxKeyboardTemplateHi-v0",
+    "MjxKeyboardSynergy-v0",
+    "MjxKeyboardSynergyHi-v0",
+    "MjxKeyboardBimanualTemplate-v0",
+    "MjxKeyboardBimanualTemplateBase-v0",
+    "MjxKeyboardBimanualSynergy-v0",
 ]
