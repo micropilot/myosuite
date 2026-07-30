@@ -50,6 +50,41 @@ def sanitize(label: str) -> str:
     return label  # letters / digits
 
 
+# --------------------------------------------------------------------------
+# Realistic (visual) keyboard: a chamfered keycap MESH per key + a chassis, all
+# visual-only (contype=conaffinity=0) so the collision boxes and every trained
+# policy are unaffected. The keycap mesh is attached to each key body so it
+# depresses with the slide joint. Meshes live under simhive/myo_sim/meshes/
+# keyboard/ (the scene's meshdir), so `file="meshes/keyboard/keycap.obj"`.
+
+def _keycap_obj_str() -> str:
+    """A unit chamfered keycap (base [-1,1]^2 at z=-1, inset top at z=+1),
+    centered at the origin so a mesh `scale` = (w_half, h_half, cap_half) makes
+    it exactly cover the collision box. Outward-wound triangles."""
+    t = 0.80  # top inset (keycap taper)
+    V = [(-1, -1, -1), (1, -1, -1), (1, 1, -1), (-1, 1, -1),        # bottom b0..b3
+         (-t, -t, 1), (t, -t, 1), (t, t, 1), (-t, t, 1)]            # top    t0..t3 (idx 4..7)
+    # quads (CCW from outside) -> two triangles each; 1-indexed for OBJ
+    quads = [(4, 5, 6, 7), (0, 3, 2, 1),                            # top, bottom
+             (0, 1, 5, 4), (1, 2, 6, 5), (2, 3, 7, 6), (3, 0, 4, 7)]  # 4 sides
+    lines = ["# unit chamfered keycap (make_keyboard.py)"]
+    lines += [f"v {x} {y} {z}" for x, y, z in V]
+    for a, b, c, d in quads:
+        lines.append(f"f {a+1} {b+1} {c+1}")
+        lines.append(f"f {a+1} {c+1} {d+1}")
+    return "\n".join(lines) + "\n"
+
+
+def write_keyboard_meshes(meshdir: str) -> str:
+    """Write keycap.obj under <meshdir>/meshes/keyboard/. Returns the relative
+    mesh path used in the XML (meshdir-relative)."""
+    d = os.path.join(meshdir, "meshes", "keyboard")
+    os.makedirs(d, exist_ok=True)
+    with open(os.path.join(d, "keycap.obj"), "w") as f:
+        f.write(_keycap_obj_str())
+    return "meshes/keyboard/keycap.obj"
+
+
 def generate(
     pitch: float = 0.019,     # 19.05 mm real key pitch
     gap: float = 0.002,       # gap between keycaps
@@ -60,6 +95,8 @@ def generate(
     damping: float = 1.0,
     keep: "set | None" = None,  # if set, only emit keys whose sanitized name is in it
     with_sensors: bool = True,  # emit touch sensors (MJX/Warp may reject touch sensors)
+    realistic: bool = False,    # add visual chamfered-keycap meshes + chassis material
+    mesh_path: str = "meshes/keyboard/keycap.obj",
     model_name: str = "qwerty_keyboard",
 ) -> str:
     """Generate the keyboard include fragment.
@@ -73,6 +110,7 @@ def generate(
     bodies: list[str] = []
     sensors: list[str] = []
     keymap: list[str] = []  # comment listing label -> name
+    sizes: dict = {}        # unique (w_half, half) -> keycap mesh index (realistic)
 
     y = 0.0
     # The hands are mounted on the +y side (forearms come from +y). For natural
@@ -94,15 +132,26 @@ def generate(
                 continue
             # position relative to the keyboard body (which is placed at base_pos)
             gpos = f"{cx:.5f} {row_y:.5f} {cap_height/2:.5f}"
+            # realistic: hide the collision box (alpha 0) and add a chamfered
+            # keycap MESH (visual only) sized to this key, so the cap depresses
+            # with the slide joint. Non-realistic: the plain visible box.
+            if realistic:
+                si = sizes.setdefault((round(w_half, 5), round(half, 5)), len(sizes))
+                box_rgba, site_rgba = "0.15 0.15 0.17 0", "0.3 0.6 0.9 0"
+                cap_geom = (f'\n        <geom name="key_{name}_cap" type="mesh" '
+                            f'mesh="keycap_s{si}" material="mat_keycap" '
+                            f'contype="0" conaffinity="0" group="2"/>')
+            else:
+                box_rgba, site_rgba, cap_geom = "0.15 0.15 0.17 1", "0.3 0.6 0.9 0.15", ""
             # gravcomp="1" keeps the key from sagging under gravity so it rests
             # at the top of its travel until a finger presses it.
             bodies.append(f"""      <body name="key_{name}" pos="{gpos}" gravcomp="1">
         <joint name="key_{name}_slide" type="slide" axis="0 0 -1" range="0 {travel:.4f}"
                stiffness="{stiffness}" damping="{damping}" springref="0" armature="0.0005"/>
         <geom name="key_{name}_geom" type="box" size="{w_half:.5f} {half:.5f} {cap_height/2:.5f}"
-              rgba="0.15 0.15 0.17 1" mass="0.005" friction="1 0.005 0.0001"/>
+              rgba="{box_rgba}" mass="0.005" friction="1 0.005 0.0001"/>{cap_geom}
         <site name="key_{name}_site" type="box" size="{w_half:.5f} {half:.5f} {cap_height/2:.5f}"
-              rgba="0.3 0.6 0.9 0.15"/>
+              rgba="{site_rgba}"/>
       </body>""")
             sensors.append(f'    <touch name="key_{name}_touch" site="key_{name}_site"/>')
             keymap.append(f"{label} -> key_{name}")
@@ -116,6 +165,19 @@ def generate(
 {sensor_xml}
   </sensor>"""
     keymap_comment = "\n".join("       " + k for k in keymap)
+    asset_block, plate_mat = "", ""
+    if realistic:
+        meshes = "\n".join(
+            f'    <mesh name="keycap_s{i}" file="{mesh_path}" '
+            f'scale="{w:.5f} {h:.5f} {cap_height/2:.5f}"/>'
+            for (w, h), i in sorted(sizes.items(), key=lambda kv: kv[1]))
+        asset_block = f"""  <asset>
+{meshes}
+    <material name="mat_keycap" rgba="0.16 0.16 0.19 1" specular="0.4" shininess="0.5" reflectance="0.05"/>
+    <material name="mat_chassis" rgba="0.07 0.07 0.08 1" specular="0.25" shininess="0.3"/>
+  </asset>
+"""
+        plate_mat = 'material="mat_chassis" '
 
     return f"""<mujocoinclude model="{model_name}">
 <!-- AUTO-GENERATED by make_keyboard.py. Do not edit by hand.
@@ -123,14 +185,14 @@ def generate(
      Key label -> body name:
 {keymap_comment}
 -->
-  <worldbody>
+{asset_block}  <worldbody>
     <body name="keyboard" pos="{base_pos[0]:.4f} {base_pos[1]:.4f} {base_pos[2]:.4f}">
       <!-- Decorative base plate (contype/conaffinity=0 -> no collision, so it
            never blocks key travel or spawns key-plate contacts). Sits below the
            key's lowest travel point. -->
       <geom name="keyboard_plate" type="box" contype="0" conaffinity="0"
             size="0.16 0.06 0.004" pos="0.14 0.038 -0.012"
-            rgba="0.08 0.08 0.09 1" mass="1.0"/>
+            {plate_mat}rgba="0.08 0.08 0.09 1" mass="1.0"/>
 {body_xml}
     </body>
   </worldbody>{sensor_block}
@@ -231,7 +293,28 @@ if __name__ == "__main__":
                          "(small board for the MJX/Warp GPU task)")
     ap.add_argument("--no-sensors", action="store_true",
                     help="omit touch sensors (MJX/Warp can reject them)")
+    ap.add_argument("--realistic", action="store_true",
+                    help="write a realistic keycap-mesh board (qwerty_keyboard_real.xml) "
+                         "+ keycap.obj + a realistic bimanual scene (visual-only; "
+                         "collision boxes unchanged, so trained policies still work)")
     args = ap.parse_args()
+    if args.realistic:
+        hand_dir = os.path.dirname(__file__)
+        meshdir = os.path.join(hand_dir, "../../../../simhive/myo_sim")
+        mp = write_keyboard_meshes(meshdir)
+        xml = generate(with_sensors=False, realistic=True, mesh_path=mp,
+                       model_name="qwerty_keyboard_real")
+        frag_out = os.path.join(hand_dir, "qwerty_keyboard_real.xml")
+        with open(frag_out, "w") as f:
+            f.write(xml)
+        scene = open(os.path.join(hand_dir, "myohand_keyboard_bimanual.xml")).read().replace(
+            'file="qwerty_keyboard.xml"', 'file="qwerty_keyboard_real.xml"')
+        scene_out = os.path.join(hand_dir, "myohand_keyboard_bimanual_real.xml")
+        with open(scene_out, "w") as f:
+            f.write(scene)
+        print(f"wrote {frag_out} ({sum(len(r) for r in ROWS)} keys, realistic); "
+              f"meshes -> {mp}; scene -> {scene_out}")
+        raise SystemExit
     if args.from_dataset:
         xml = generate_from_dataset(args.from_dataset)
         n_keys = xml.count("<body name=\"key_")
