@@ -60,6 +60,15 @@ keyboard_env_config = config_dict.ConfigDict({**base_config, **config_dict.creat
     naconmax_per_env=48,   # contact-buffer budget/env (broadphase candidates, pre-filter)
     target_keys=(),        # () -> every key on the board is targetable
     obs_released_seen=False,  # P5: expose the debounced release latch in the obs
+    # multi-key WORD typing (WACV). Inert at these defaults -> the single-key
+    # task (and the archived checkpoints) are byte-identical; the words configs
+    # below switch them on.
+    obs_lookahead=0,            # >0: expose N upcoming keys (+ latch) -> Markov obs
+    grace_steps=12,             # steps after a keystroke before a far-fail can fire
+    switch_done_mode="target",  # "target" (old, dist-to-current) | "board" (off-home)
+    board_far_th=0.12,          # home-region radius for the "board" fail test (m)
+    home_relax_on_handoff=True, # exempt the just-used finger from the home penalty
+    word_table_path="",         # npz of padded real words; "" -> uniform-random keys
     # human muscle-synergy action space (Task 1). When synergy=True the policy
     # acts in K human-synergy latents per hand (decoded to muscle activations by
     # a FIXED linear map) + the base servos, instead of raw per-muscle commands.
@@ -79,6 +88,8 @@ keyboard_env_config = config_dict.ConfigDict({**base_config, **config_dict.creat
         act_reg_weight=1.0,
         penalty_weight=10.0,
         keystroke_weight=5.0,   # sparse bonus per completed keystroke (seq mode)
+        progress_weight=0.0,    # per-keystroke progress bonus scaled by word depth
+        approach_weight=0.0,    # shaping toward the NEXT key (pre-positioning)
     ),
 )})
 model_path = "envs/myo/assets/hand/"
@@ -180,6 +191,29 @@ keyboard_bimanual_template_base_config["reward_config"]["muscle_match_weight"] =
 keyboard_bimanual_synergy_config = copy.deepcopy(keyboard_bimanual_template_config)
 keyboard_bimanual_synergy_config["synergy"] = True
 keyboard_bimanual_synergy_config["synergy_k"] = 12
+
+# ===================== WACV: multi-key WORD typing ===========================
+# Long-duration real-word typing. The obs layout is FIXED (lookahead L=2 + the
+# release latch) and independent of sequence_length, so curriculum stages
+# (seq 1->2->4->8) warm-start each other. `word_table_path`, `sequence_length`
+# and `max_episode_steps` are overridden per curriculum stage by the driver
+# (training/curriculum_words.py); the defaults here give a runnable 4-key env.
+def _make_words_config(base):
+    cfg = copy.deepcopy(base)
+    cfg["obs_lookahead"] = 2
+    cfg["switch_done_mode"] = "board"
+    cfg["grace_steps"] = 12
+    cfg["board_far_th"] = 0.14
+    cfg["sequence_length"] = 4
+    cfg["max_episode_steps"] = 4 * 45          # ~45 ctrl steps (0.9 s) per key
+    cfg["reward_config"]["progress_weight"] = 5.0
+    cfg["reward_config"]["approach_weight"] = 0.5
+    return cfg
+
+# Single right hand, full board (cheap dev path) -> right-reachable words.
+keyboard_words_config = _make_words_config(keyboard_template_base_config)
+# Bimanual full board (the real target) -> whole-keyboard words, two hands.
+keyboard_words_bimanual_config = _make_words_config(keyboard_bimanual_template_base_config)
 
 ppo_config = config_dict.create(
     num_timesteps=50_000_000,
@@ -344,7 +378,12 @@ def make(env_name: str, config_overrides=None) -> mjx_env.MjxEnv:
 
     if "MjxKeyboard" in env_name_base:
         # NOTE: order matters (substring match) -> most specific names first.
-        if "BimanualSynergy" in env_name_base:
+        # (WordsBimanual before Bimanual, and both words names before the rest.)
+        if "WordsBimanual" in env_name_base:
+            cfg = keyboard_words_bimanual_config
+        elif "Words" in env_name_base:
+            cfg = keyboard_words_config
+        elif "BimanualSynergy" in env_name_base:
             cfg = keyboard_bimanual_synergy_config
         elif "BimanualTemplateBase" in env_name_base:
             cfg = keyboard_bimanual_template_base_config
@@ -395,4 +434,6 @@ env_names = [
     "MjxKeyboardBimanualTemplate-v0",
     "MjxKeyboardBimanualTemplateBase-v0",
     "MjxKeyboardBimanualSynergy-v0",
+    "MjxKeyboardWords-v0",
+    "MjxKeyboardWordsBimanual-v0",
 ]

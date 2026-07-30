@@ -112,6 +112,35 @@ class MjxKeyboardEnvV0(MjxMyoBase):
         self._seq_len = int(self._config.get("sequence_length", 1))
         self._is_seq = self._seq_len > 1
 
+        # ---- multi-key WORD typing (WACV) -----------------------------------
+        # All gated: with the defaults below the env is byte-identical to the
+        # single-key task, so the archived checkpoints reproduce unchanged.
+        self._obs_L = int(self._config.get("obs_lookahead", 0))   # next-key preview slots
+        self._grace = int(self._config.get("grace_steps", 12))    # steps after a key-switch
+        self._switch_mode = str(self._config.get("switch_done_mode", "target"))
+        self._board_far_th = float(self._config.get("board_far_th", 0.12))
+        self._home_relax = bool(self._config.get("home_relax_on_handoff", True))
+        # ordered names of the targetable keys (for the word-table board check).
+        self._target_names = [self.key_names[int(t)]
+                              for t in np.asarray(self._target_ids)]
+        # optional real-word table: (n_words, seq_len) positions into target_ids,
+        # padded to the static width self._seq_len, + per-word true length.
+        self._word_seqs = None
+        wt = self._config.get("word_table_path", "")
+        if wt:
+            z = np.load(wt, allow_pickle=True)
+            seqs = np.asarray(z["seqs"]).astype(np.int32)
+            lens = np.asarray(z["lengths"]).astype(np.int32)
+            assert seqs.shape[1] == self._seq_len, (
+                f"word table width {seqs.shape[1]} != sequence_length {self._seq_len}")
+            if "target_names" in z.files:
+                tn = [str(k) for k in z["target_names"]]
+                assert tn == self._target_names, (
+                    "word table was built for a different board layout")
+            self._word_seqs = jp.asarray(seqs)
+            self._word_lengths = jp.asarray(lens)
+            self._n_words = int(seqs.shape[0])
+
     # ------------------------------------------------------------- build-time
     def _discover_keyboard(self, model):
         """Introspect key bodies produced by make_keyboard.py -> constant arrays."""
@@ -521,6 +550,34 @@ class MjxKeyboardEnvV0(MjxMyoBase):
         reach_dist = jp.linalg.norm(reach_err)
         return reach_err, reach_dist, self._key_travel_frac(data, key), fa
 
+    def _slot_geometry(self, data, info, j):
+        """Geometry for the key `j` positions ahead of the current one, clamped
+        into the padded width and flagged valid only if it is a real (unpadded)
+        upcoming key. Returns (target_pos, assigned_finger, reach_err, valid)."""
+        pos = jp.minimum(info["seq_pos"] + j, self._seq_len - 1)
+        valid = (info["seq_pos"] + j < info["seq_len_actual"]).astype(jp.float32)
+        tgt_pos = info["sequence"][pos]
+        key = self._target_ids[tgt_pos]
+        fa = self._key_finger[key]
+        reach_err = data.site_xpos[self._key_site_ids[key]] - data.site_xpos[self._tip_sids[fa]]
+        return tgt_pos, fa, reach_err, valid
+
+    def _lookahead_block(self, data, info):
+        """Fixed L-slot preview of upcoming keys so the policy can pre-position.
+        Each slot: target one-hot + assigned-finger one-hot + reach vector (all
+        masked by a validity bit) + the validity bit. Padding -> zeros, so the
+        obs shape is static and identical across word lengths."""
+        slots = []
+        for j in range(1, self._obs_L + 1):
+            tgt_pos, fa, reach_err, valid = self._slot_geometry(data, info, j)
+            slots.append(jp.concatenate([
+                jax.nn.one_hot(tgt_pos, self._n_targets) * valid,
+                jax.nn.one_hot(fa, self._n_tips) * valid,
+                reach_err * valid,
+                jp.array([valid]),
+            ]))
+        return jp.concatenate(slots)
+
     def _seq_advance(self, data, info):
         """Debounced keystroke detection for the CURRENT sequence key: it counts
         as a completed keystroke when depressed past `press_th` by its assigned
@@ -536,10 +593,15 @@ class MjxKeyboardEnvV0(MjxMyoBase):
 
     # ------------------------------------------------------------------ reset
     def _sample_sequence(self, rng):
-        """A sequence of `seq_len` target positions (indices into target_ids)."""
-        return jax.random.randint(
-            rng, (self._seq_len,), 0, self._n_targets, dtype=jp.int32
-        )
+        """Return (sequence, true_length): a `seq_len`-wide array of target
+        positions + how many of them are real keys. With a word table loaded,
+        draw a real (padded) word; otherwise draw `seq_len` uniform-random keys
+        (all real -> single-key behavior at seq_len=1 is unchanged)."""
+        if self._word_seqs is not None:
+            w = jax.random.randint(rng, (), 0, self._n_words, dtype=jp.int32)
+            return self._word_seqs[w], self._word_lengths[w]
+        seq = jax.random.randint(rng, (self._seq_len,), 0, self._n_targets, dtype=jp.int32)
+        return seq, jp.array(self._seq_len, dtype=jp.int32)
 
     def _randomized_init_qpos(self, rng):
         qpos = self._init_qpos
@@ -555,13 +617,16 @@ class MjxKeyboardEnvV0(MjxMyoBase):
 
     def reset(self, rng: jp.ndarray) -> State:
         rng, rng_t, rng_q = jax.random.split(rng, 3)
-        sequence = self._sample_sequence(rng_t)
+        sequence, seq_len_actual = self._sample_sequence(rng_t)
         qpos = self._randomized_init_qpos(rng_q)
         qvel = jp.zeros(self.mjx_model.nv)
 
         info = {"rng": rng, "sequence": sequence,
                 "seq_pos": jp.array(0, dtype=jp.int32),
+                "seq_len_actual": seq_len_actual,
                 "released_seen": jp.array(1.0),
+                "switch_cooldown": jp.array(0, dtype=jp.int32),
+                "prev_fa": jp.array(-1, dtype=jp.int32),
                 "step_count": jp.array(0, dtype=jp.int32)}
         data = self._get_data(qpos, qvel)
         obs = self._get_obs(data, info)
@@ -589,22 +654,29 @@ class MjxKeyboardEnvV0(MjxMyoBase):
             finger_onehot,
             jp.array([travel]),
         ]
-        # P5: optionally expose the release-gate latch (the one bit of hidden
-        # sequence state) directly. Off by default so the GPU obs stays a pure
-        # single-frame; on -> the debounced release latch is observable, the
-        # exact-latch alternative to frame-stacking a history window.
-        if self._config.get("obs_released_seen", False):
+        # Multi-key words (obs_lookahead>0): a fixed L-slot preview of upcoming
+        # keys so the policy can pre-position the next finger, then the release
+        # latch (always exposed here to make the debounced keystroke Markov).
+        if self._obs_L > 0:
+            parts.append(self._lookahead_block(data, info))
+        # P5 / words: expose the release-gate latch (the one bit of hidden
+        # sequence state). Forced on with lookahead; otherwise config-gated so
+        # the single-key obs stays a pure single frame (unchanged, byte-for-byte).
+        if self._obs_L > 0 or self._config.get("obs_released_seen", False):
             parts.append(jp.array([info["released_seen"]]))
         obs = jp.concatenate(parts)
         return {"state": obs}
 
     # ----------------------------------------------------------------- reward
-    def _other_finger_disp(self, data, fa):
+    def _other_finger_disp(self, data, fa, fa2=-1):
+        """Mean home-displacement of the fingers NOT pressing the current key.
+        `fa2` optionally exempts a second finger (the just-used one during a
+        hand-off); fa2=-1 -> one_hot is all-zeros so the value is unchanged."""
         tips = data.site_xpos[self._tip_sids]
         disp = jp.linalg.norm(tips - self._finger_home, axis=-1)
         n = disp.shape[0]
-        mask = 1.0 - jax.nn.one_hot(fa, n)
-        return jp.sum(disp * mask) / (n - 1)
+        mask = (1.0 - jax.nn.one_hot(fa, n)) * (1.0 - jax.nn.one_hot(fa2, n))
+        return jp.sum(disp * mask) / jp.maximum(jp.sum(mask), 1.0)
 
     def _get_rewards(self, data: mjx.Data, info: Dict) -> Dict:
         rc = self._config.reward_config
@@ -615,7 +687,11 @@ class MjxKeyboardEnvV0(MjxMyoBase):
             data.time > 2.0 * self.mjx_model.opt.timestep, self._far_th, jp.inf
         )
         act_mag = jp.linalg.norm(data.act) / self._na if self._na > 0 else 0.0
-        other_disp = self._other_finger_disp(data, fa)
+        # during a hand-off (grace window) also exempt the just-used finger from
+        # the home penalty so it can retract while the next finger presses.
+        fa2 = (jp.where(info["switch_cooldown"] > 0, info["prev_fa"], -1)
+               if (self._home_relax and self._is_seq) else -1)
+        other_disp = self._other_finger_disp(data, fa, fa2)
 
         rewards = {
             "reach": -reach_dist * rc.reach_weight,
@@ -629,6 +705,18 @@ class MjxKeyboardEnvV0(MjxMyoBase):
             # sparse bonus each time a keystroke in the word is completed.
             advance, _ = self._seq_advance(data, info)
             rewards["keystroke"] = advance.astype(jp.float32) * rc.keystroke_weight
+            prog_w = float(rc.get("progress_weight", 0.0))
+            if prog_w:
+                # deeper keystrokes worth proportionally more (counteracts the
+                # discount washing out the tail of a long word).
+                pos_frac = (info["seq_pos"].astype(jp.float32) + 1.0) / \
+                    info["seq_len_actual"].astype(jp.float32)
+                rewards["progress"] = advance.astype(jp.float32) * pos_frac * prog_w
+            app_w = float(rc.get("approach_weight", 0.0))
+            if app_w:
+                # pre-position: shape the NEXT finger toward the next key.
+                _, _nfa, nerr, nvalid = self._slot_geometry(data, info, 1)
+                rewards["approach"] = -jp.linalg.norm(nerr) * nvalid * app_w
         if self._muscle_match_weight > 0 and self._template_nm > 0:
             rewards["muscle_match"] = (
                 self._muscle_match(data, info) * self._muscle_match_weight
@@ -648,14 +736,25 @@ class MjxKeyboardEnvV0(MjxMyoBase):
         return jp.exp(-20.0 * mse) * self._template_mask[key]
 
     def _get_done(self, state: State) -> float:
-        _, reach_dist, _, _ = self._key_geometry(state.data, state.info)
-        far_th = jp.where(
-            state.data.time > 2.0 * self.mjx_model.opt.timestep, self._far_th, jp.inf
-        )
-        done = reach_dist > far_th
+        data, info = state.data, state.info
+        _, reach_dist, _, fa = self._key_geometry(data, info)
+        # fail test: distance to the CURRENT target (target mode) OR the current
+        # finger wandering off its home region (board mode -- independent of which
+        # key just became active, so a key-switch no longer instantly ends it).
+        if self._switch_mode == "board":
+            off = jp.linalg.norm(data.site_xpos[self._tip_sids[fa]][:2]
+                                 - self._finger_home[fa][:2])
+            fail = off > self._board_far_th
+        else:
+            fail = reach_dist > self._far_th
+        # exempt the first 2 sim steps, and (seq) the post-switch grace window.
+        exempt = data.time <= 2.0 * self.mjx_model.opt.timestep
         if self._is_seq:
-            advance, _ = self._seq_advance(state.data, state.info)
-            word_done = (state.info["seq_pos"] + advance.astype(jp.int32)) >= self._seq_len
+            exempt = jp.logical_or(exempt, info["switch_cooldown"] > 0)
+        done = jp.logical_and(fail, jp.logical_not(exempt))
+        if self._is_seq:
+            advance, _ = self._seq_advance(data, info)
+            word_done = (info["seq_pos"] + advance.astype(jp.int32)) >= info["seq_len_actual"]
             done = jp.logical_or(done, word_done)
         return 1.0 * done
 
@@ -668,7 +767,7 @@ class MjxKeyboardEnvV0(MjxMyoBase):
         keystrokes, words = zero, zero
         if self._is_seq:
             advance, _ = self._seq_advance(state.data, state.info)
-            word_done = (state.info["seq_pos"] + advance.astype(jp.int32)) >= self._seq_len
+            word_done = (state.info["seq_pos"] + advance.astype(jp.int32)) >= state.info["seq_len_actual"]
             keystrokes = advance.astype(jp.float32)
             words = word_done.astype(jp.float32)
         muscle_match = zero
@@ -696,11 +795,12 @@ class MjxKeyboardEnvV0(MjxMyoBase):
             1.0 - done, jp.array(0.0),
         )
         rng, rng_t = jax.random.split(info["rng"])
+        new_seq, new_len = self._sample_sequence(rng_t)
 
         if self._is_seq:
             advance, released_now = self._seq_advance(state.data, info)
             seq_pos_after = info["seq_pos"] + advance.astype(jp.int32)
-            word_done = seq_pos_after >= self._seq_len
+            word_done = seq_pos_after >= info["seq_len_actual"]
             # released_seen for the next step: after advancing it is set from the
             # NEW key (fresh, un-pressed -> released), else the debounced value.
             new_pos = jp.minimum(seq_pos_after, self._seq_len - 1)
@@ -710,18 +810,32 @@ class MjxKeyboardEnvV0(MjxMyoBase):
                 advance, (new_travel < self._release_th).astype(jp.float32), released_now.astype(jp.float32)
             )
             reset_ep = jp.logical_or(jp.logical_or(done > 0.5, truncation > 0.5), word_done)
-            sequence = jp.where(reset_ep, self._sample_sequence(rng_t), info["sequence"])
+            sequence = jp.where(reset_ep, new_seq, info["sequence"])
+            seq_len_actual = jp.where(reset_ep, new_len, info["seq_len_actual"])
             seq_pos = jp.where(reset_ep, jp.array(0, dtype=jp.int32), seq_pos_after)
             released_seen = jp.where(reset_ep, jp.array(1.0), released_after)
+            # grace timer: (re)arm on a keystroke, else decay toward 0; and record
+            # the just-pressed finger so the home penalty can exempt it on hand-off.
+            _, _, _, cur_fa = self._key_geometry(state.data, info)
+            sc = jp.where(advance, jp.array(self._grace, dtype=jp.int32),
+                          jp.maximum(info["switch_cooldown"] - 1, 0))
+            switch_cooldown = jp.where(reset_ep, jp.array(0, dtype=jp.int32), sc)
+            prev_fa = jp.where(advance, cur_fa, info["prev_fa"])
+            prev_fa = jp.where(reset_ep, jp.array(-1, dtype=jp.int32), prev_fa)
         else:
             reset_ep = jp.logical_or(done > 0.5, truncation > 0.5)
-            sequence = jp.where(reset_ep, self._sample_sequence(rng_t), info["sequence"])
+            sequence = jp.where(reset_ep, new_seq, info["sequence"])
+            seq_len_actual = info["seq_len_actual"]
             seq_pos = jp.array(0, dtype=jp.int32)
             released_seen = jp.array(1.0)
+            switch_cooldown = jp.array(0, dtype=jp.int32)
+            prev_fa = jp.array(-1, dtype=jp.int32)
 
         step_count = jp.where(reset_ep, jp.array(0, dtype=jp.int32), info["step_count"])
         return {**info, "rng": rng, "step_count": step_count, "sequence": sequence,
-                "seq_pos": seq_pos, "released_seen": released_seen}
+                "seq_len_actual": seq_len_actual, "seq_pos": seq_pos,
+                "released_seen": released_seen, "switch_cooldown": switch_cooldown,
+                "prev_fa": prev_fa}
 
     # --------------------------------------------------------------- dynamics
     def _step_simulation(self, state, action):
