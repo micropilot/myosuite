@@ -87,6 +87,37 @@ register_env_with_variants(
     },
 )
 
+# Dataset-matched keyboard (layout taken verbatim from the Aalto "How We Type"
+# mocap dataset) — used for imitation learning so the sim keyboard is identical
+# to the one the human mocap was recorded on.
+register_env_with_variants(
+    id="myoHandKeyPressDS-v0",
+    entry_point="myosuite.envs.myo.myobase.keyboard_v0:KeyboardEnvV0",
+    max_episode_steps=150,
+    kwargs={
+        "model_path": curr_dir + "/../assets/hand/myohand_keyboard_dataset.xml",
+        "target_keys": [  # right-side keys present in the dataset layout
+            "6", "7", "8", "9", "0",
+            "y", "u", "i", "o", "p",
+            "h", "j", "k", "l",
+            "n", "m", "comma", "period", "space",
+        ],
+        "normalize_act": True,
+        "frame_skip": 10,
+    },
+)
+register_env_with_variants(
+    id="myoBimanualKeyPressDS-v0",
+    entry_point="myosuite.envs.myo.myobase.keyboard_v0:BimanualKeyboardEnvV0",
+    max_episode_steps=150,
+    kwargs={
+        "model_path": curr_dir + "/../assets/hand/myohand_keyboard_bimanual_dataset.xml",
+        "target_keys": None,   # full 39-key dataset layout
+        "normalize_act": True,
+        "frame_skip": 10,
+    },
+)
+
 # Finger-tip reaching ==============================
 register_env_with_variants(
     id="motorFingerReachFixed-v0",
