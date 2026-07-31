@@ -56,7 +56,8 @@ keyboard_env_config = config_dict.ConfigDict({**base_config, **config_dict.creat
     finger_spread=0.3,     # MCP abduction to fan fingers across columns
     hover_z=0.03,          # base_z init so fingertips hover above keys
     home_offset=(0.04, 0.04),  # (dx,dy) base shift so fingers rest on keys
-    finger_assignment="geometric",  # "geometric" (nearest finger) | "dataset" (human touch-typing)
+    finger_assignment="geometric",  # "geometric" | "dataset" (hard human argmax) | "distribution" (human finger dist)
+    finger_valid_thresh=0.05,        # distribution mode: min human prob for a finger to be usable on a key
     wrist_stiffness=8.0,   # passive stiffness holding the wrist pose
     naconmax_per_env=48,   # contact-buffer budget/env (broadphase candidates, pre-filter)
     target_keys=(),        # () -> every key on the board is targetable
@@ -93,6 +94,7 @@ keyboard_env_config = config_dict.ConfigDict({**base_config, **config_dict.creat
         approach_weight=0.0,    # shaping toward the NEXT key (pre-positioning)
         word_complete_weight=0.0,  # terminal bonus for finishing the whole word
         dwell_weight=0.0,       # per-step living cost (rewards typing speed)
+        finger_match_weight=0.0,  # distribution mode: reward using a human-likely finger
     ),
 )})
 model_path = "envs/myo/assets/hand/"
@@ -237,6 +239,15 @@ _rcs["dwell_weight"] = 0.15           # per-step living cost -> reward speed
 # the finger CHOICE is human-like (index/middle heavy, pinky rare), not just effort.
 keyboard_words_bimanual_shaped_hf_config = copy.deepcopy(keyboard_words_bimanual_shaped_config)
 keyboard_words_bimanual_shaped_hf_config["finger_assignment"] = "dataset"
+
+# DISTRIBUTION variant: the policy may press each key with ANY human-plausible
+# finger (the ones people actually use, prob>thresh) and is REWARDED by the human
+# probability of the finger it used -- softer + more faithful than the hard argmax
+# (HF), and lets it use the easy finger on ambiguous keys (a/s/o/l) while staying
+# human on the strongly-consistent ones (t/e/f/g).
+keyboard_words_bimanual_shaped_dist_config = copy.deepcopy(keyboard_words_bimanual_shaped_config)
+keyboard_words_bimanual_shaped_dist_config["finger_assignment"] = "distribution"
+keyboard_words_bimanual_shaped_dist_config["reward_config"]["finger_match_weight"] = 15.0
 
 ppo_config = config_dict.create(
     num_timesteps=50_000_000,
@@ -402,7 +413,9 @@ def make(env_name: str, config_overrides=None) -> mjx_env.MjxEnv:
     if "MjxKeyboard" in env_name_base:
         # NOTE: order matters (substring match) -> most specific names first.
         # (WordsBimanual before Bimanual, and both words names before the rest.)
-        if "WordsBimanualShapedHF" in env_name_base:
+        if "WordsBimanualShapedDist" in env_name_base:
+            cfg = keyboard_words_bimanual_shaped_dist_config
+        elif "WordsBimanualShapedHF" in env_name_base:
             cfg = keyboard_words_bimanual_shaped_hf_config
         elif "WordsBimanualShaped" in env_name_base:
             cfg = keyboard_words_bimanual_shaped_config
@@ -465,4 +478,5 @@ env_names = [
     "MjxKeyboardWordsBimanual-v0",
     "MjxKeyboardWordsBimanualShaped-v0",
     "MjxKeyboardWordsBimanualShapedHF-v0",
+    "MjxKeyboardWordsBimanualShapedDist-v0",
 ]

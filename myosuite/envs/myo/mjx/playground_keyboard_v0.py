@@ -65,8 +65,11 @@ class MjxKeyboardEnvV0(MjxMyoBase):
         self._apply_contact_filtering(self._mj_model)
         self._bake_typing_posture(self._mj_model)  # sets self._init_qpos, stiffness
         self._assign_fingers_geometric(self._mj_model)  # sets self._key_finger, home
-        if self._config.get("finger_assignment", "geometric") == "dataset":
-            self._assign_fingers_dataset(self._mj_model)  # override with human data
+        self._finger_mode = str(self._config.get("finger_assignment", "geometric"))
+        if self._finger_mode == "dataset":
+            self._assign_fingers_dataset(self._mj_model)   # hard human argmax finger
+        if self._finger_mode == "distribution":
+            self._load_finger_dist()                        # human finger DISTRIBUTION
         self._report_finger_match()
 
         self._mjx_model = mjx.put_model(self._mj_model, impl=self._config.impl)
@@ -356,6 +359,43 @@ class MjxKeyboardEnvV0(MjxMyoBase):
             print(f"[finger match] assignment agrees with How-We-Type on "
                   f"{hit}/{tot} keys ({100*hit/tot:.0f}%)")
 
+    def _load_finger_dist(self):
+        """Build per-key human finger PROBABILITY (n_keys, n_tips) + a validity mask
+        (prob > thresh) from finger_counts.json, for the distribution-reward mode:
+        the policy may press each key with ANY human-plausible finger (nearest of
+        them), rewarded by how often humans use that finger for the key. Softer +
+        more faithful than the hard argmax assignment."""
+        import json
+        from etils import epath
+        NAME2ID = {"R_Thumb": 0, "R_Index": 1, "R_Middle": 2, "R_Ring": 3, "R_Little": 4,
+                   "L_Thumb": 5, "L_Index": 6, "L_Middle": 7, "L_Ring": 8, "L_Little": 9}
+        root = epath.Path(__file__).parent.parent.parent.parent.parent.parent
+        n_keys, n_tips = len(self.key_names), len(self._tip_sids_np)
+        prob = np.zeros((n_keys, n_tips), np.float32)
+        try:
+            counts = json.load(open((root / "datasets/how_we_type/finger_counts.json").as_posix()))
+        except Exception:
+            counts = {}
+        thr = float(self._config.get("finger_valid_thresh", 0.05))
+        for kid, kname in enumerate(self.key_names):
+            c = counts.get(kname)
+            if c:
+                tot = sum(c.values())
+                for fn, n in c.items():
+                    fid = NAME2ID.get(fn)
+                    if fid is not None and fid < n_tips:
+                        prob[kid, fid] = n / tot
+            if prob[kid].sum() < 1e-6:                       # no data -> geometric finger
+                prob[kid, int(self._key_finger_np[kid])] = 1.0
+        valid = (prob > thr).astype(np.float32)
+        for kid in range(n_keys):                            # >=1 valid finger per key
+            if valid[kid].sum() < 0.5:
+                valid[kid, int(prob[kid].argmax())] = 1.0
+        self._finger_prob = jp.asarray(prob)
+        self._finger_valid = jp.asarray(valid)
+        print(f"[finger distribution] loaded; avg {valid.sum(1).mean():.1f} plausible "
+              f"fingers/key (prob>{thr})")
+
     def _load_muscle_template(self):
         """Per-key HUMAN muscle template -> static (n_keys, na) target-activation
         array (indexed by MODEL key id) + a per-muscle validity mask (n_keys, na)
@@ -595,13 +635,23 @@ class MjxKeyboardEnvV0(MjxMyoBase):
         return jp.clip(data.qpos[self._key_qposadr[key]] / self._key_travel[key], 0.0, 1.5)
 
     def _key_geometry(self, data, info):
-        """(reach_err, reach_dist, travel_frac, assigned_finger) for the target."""
+        """(reach_err, reach_dist, travel_frac, finger) for the target key. In
+        'distribution' mode the finger is the NEAREST human-plausible finger for the
+        key (so the policy may choose among the fingers people actually use); else it
+        is the fixed assigned finger."""
         key = self._target_key(info)
-        fa = self._key_finger[key]
         target_pos = data.site_xpos[self._key_site_ids[key]]
-        tip_pos = data.site_xpos[self._tip_sids[fa]]
-        reach_err = target_pos - tip_pos
-        reach_dist = jp.linalg.norm(reach_err)
+        if self._finger_mode == "distribution":
+            tips = data.site_xpos[self._tip_sids]
+            dists = jp.linalg.norm(tips - target_pos, axis=-1)
+            dists = jp.where(self._finger_valid[key] > 0.5, dists, jp.inf)
+            fa = jp.argmin(dists).astype(jp.int32)
+            reach_err = target_pos - tips[fa]
+            reach_dist = dists[fa]
+        else:
+            fa = self._key_finger[key]
+            reach_err = target_pos - data.site_xpos[self._tip_sids[fa]]
+            reach_dist = jp.linalg.norm(reach_err)
         return reach_err, reach_dist, self._key_travel_frac(data, key), fa
 
     def _slot_geometry(self, data, info, j):
@@ -782,6 +832,12 @@ class MjxKeyboardEnvV0(MjxMyoBase):
                 # per-step living cost -> reward SPEED, so holding a pressed key
                 # (the reward-hack local optimum) is strictly costly.
                 rewards["dwell"] = -jp.ones(()) * dwell_w
+            fm_w = float(rc.get("finger_match_weight", 0.0))
+            if fm_w and self._finger_mode == "distribution":
+                # reward completing the keystroke with a finger people actually use
+                # for this key, weighted by the human probability of that finger.
+                key = self._target_key(info)
+                rewards["finger_match"] = advance.astype(jp.float32) * self._finger_prob[key, fa] * fm_w
         if self._muscle_match_weight > 0 and self._template_nm > 0:
             rewards["muscle_match"] = (
                 self._muscle_match(data, info) * self._muscle_match_weight
