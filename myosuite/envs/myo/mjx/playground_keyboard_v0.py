@@ -717,6 +717,17 @@ class MjxKeyboardEnvV0(MjxMyoBase):
                 # pre-position: shape the NEXT finger toward the next key.
                 _, _nfa, nerr, nvalid = self._slot_geometry(data, info, 1)
                 rewards["approach"] = -jp.linalg.norm(nerr) * nvalid * app_w
+            wc_w = float(rc.get("word_complete_weight", 0.0))
+            if wc_w:
+                # big terminal bonus for finishing the whole word -> makes
+                # completing strictly better than camping on an early key.
+                word_done = (info["seq_pos"] + advance.astype(jp.int32)) >= info["seq_len_actual"]
+                rewards["word_complete"] = word_done.astype(jp.float32) * wc_w
+            dwell_w = float(rc.get("dwell_weight", 0.0))
+            if dwell_w:
+                # per-step living cost -> reward SPEED, so holding a pressed key
+                # (the reward-hack local optimum) is strictly costly.
+                rewards["dwell"] = -jp.ones(()) * dwell_w
         if self._muscle_match_weight > 0 and self._template_nm > 0:
             rewards["muscle_match"] = (
                 self._muscle_match(data, info) * self._muscle_match_weight

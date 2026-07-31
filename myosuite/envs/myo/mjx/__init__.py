@@ -90,6 +90,8 @@ keyboard_env_config = config_dict.ConfigDict({**base_config, **config_dict.creat
         keystroke_weight=5.0,   # sparse bonus per completed keystroke (seq mode)
         progress_weight=0.0,    # per-keystroke progress bonus scaled by word depth
         approach_weight=0.0,    # shaping toward the NEXT key (pre-positioning)
+        word_complete_weight=0.0,  # terminal bonus for finishing the whole word
+        dwell_weight=0.0,       # per-step living cost (rewards typing speed)
     ),
 )})
 model_path = "envs/myo/assets/hand/"
@@ -214,6 +216,20 @@ def _make_words_config(base):
 keyboard_words_config = _make_words_config(keyboard_template_base_config)
 # Bimanual full board (the real target) -> whole-keyboard words, two hands.
 keyboard_words_bimanual_config = _make_words_config(keyboard_bimanual_template_base_config)
+
+# SHAPED reward for long words: the default dense press(5)+bonus(3) reward lets
+# the policy reward-hack by CAMPING on an early key; at 8 keys this caps word
+# completion ~15-20%. Rebalance so ADVANCING dominates HOLDING: kill the camping
+# bonus, shrink press, and make each keystroke + finishing the word the payoff,
+# with a small per-step dwell cost to reward speed.
+keyboard_words_bimanual_shaped_config = copy.deepcopy(keyboard_words_bimanual_config)
+_rcs = keyboard_words_bimanual_shaped_config["reward_config"]
+_rcs["press_weight"] = 1.0            # was 5.0 (dense press -> camping)
+_rcs["bonus_weight"] = 0.0            # was 3.0 (holding-a-key bonus removed)
+_rcs["keystroke_weight"] = 25.0       # was 5.0 (each new key is the main reward)
+_rcs["progress_weight"] = 12.0        # was 5.0 (depth-scaled)
+_rcs["word_complete_weight"] = 60.0   # big terminal bonus for finishing the word
+_rcs["dwell_weight"] = 0.15           # per-step living cost -> reward speed
 
 ppo_config = config_dict.create(
     num_timesteps=50_000_000,
@@ -379,7 +395,9 @@ def make(env_name: str, config_overrides=None) -> mjx_env.MjxEnv:
     if "MjxKeyboard" in env_name_base:
         # NOTE: order matters (substring match) -> most specific names first.
         # (WordsBimanual before Bimanual, and both words names before the rest.)
-        if "WordsBimanual" in env_name_base:
+        if "WordsBimanualShaped" in env_name_base:
+            cfg = keyboard_words_bimanual_shaped_config
+        elif "WordsBimanual" in env_name_base:
             cfg = keyboard_words_bimanual_config
         elif "Words" in env_name_base:
             cfg = keyboard_words_config
@@ -436,4 +454,5 @@ env_names = [
     "MjxKeyboardBimanualSynergy-v0",
     "MjxKeyboardWords-v0",
     "MjxKeyboardWordsBimanual-v0",
+    "MjxKeyboardWordsBimanualShaped-v0",
 ]
