@@ -56,6 +56,7 @@ keyboard_env_config = config_dict.ConfigDict({**base_config, **config_dict.creat
     finger_spread=0.3,     # MCP abduction to fan fingers across columns
     hover_z=0.03,          # base_z init so fingertips hover above keys
     home_offset=(0.04, 0.04),  # (dx,dy) base shift so fingers rest on keys
+    finger_assignment="geometric",  # "geometric" (nearest finger) | "dataset" (human touch-typing)
     wrist_stiffness=8.0,   # passive stiffness holding the wrist pose
     naconmax_per_env=48,   # contact-buffer budget/env (broadphase candidates, pre-filter)
     target_keys=(),        # () -> every key on the board is targetable
@@ -231,6 +232,12 @@ _rcs["progress_weight"] = 12.0        # was 5.0 (depth-scaled)
 _rcs["word_complete_weight"] = 60.0   # big terminal bonus for finishing the word
 _rcs["dwell_weight"] = 0.15           # per-step living cost -> reward speed
 
+# HUMAN-FINGER variant: same shaped reward, but the key->finger assignment comes
+# from the How-We-Type dataset (dominant finger per key) instead of geometric, so
+# the finger CHOICE is human-like (index/middle heavy, pinky rare), not just effort.
+keyboard_words_bimanual_shaped_hf_config = copy.deepcopy(keyboard_words_bimanual_shaped_config)
+keyboard_words_bimanual_shaped_hf_config["finger_assignment"] = "dataset"
+
 ppo_config = config_dict.create(
     num_timesteps=50_000_000,
     learning_rate=3e-4,
@@ -395,7 +402,9 @@ def make(env_name: str, config_overrides=None) -> mjx_env.MjxEnv:
     if "MjxKeyboard" in env_name_base:
         # NOTE: order matters (substring match) -> most specific names first.
         # (WordsBimanual before Bimanual, and both words names before the rest.)
-        if "WordsBimanualShaped" in env_name_base:
+        if "WordsBimanualShapedHF" in env_name_base:
+            cfg = keyboard_words_bimanual_shaped_hf_config
+        elif "WordsBimanualShaped" in env_name_base:
             cfg = keyboard_words_bimanual_shaped_config
         elif "WordsBimanual" in env_name_base:
             cfg = keyboard_words_bimanual_config
@@ -455,4 +464,5 @@ env_names = [
     "MjxKeyboardWords-v0",
     "MjxKeyboardWordsBimanual-v0",
     "MjxKeyboardWordsBimanualShaped-v0",
+    "MjxKeyboardWordsBimanualShapedHF-v0",
 ]

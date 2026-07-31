@@ -65,6 +65,9 @@ class MjxKeyboardEnvV0(MjxMyoBase):
         self._apply_contact_filtering(self._mj_model)
         self._bake_typing_posture(self._mj_model)  # sets self._init_qpos, stiffness
         self._assign_fingers_geometric(self._mj_model)  # sets self._key_finger, home
+        if self._config.get("finger_assignment", "geometric") == "dataset":
+            self._assign_fingers_dataset(self._mj_model)  # override with human data
+        self._report_finger_match()
 
         self._mjx_model = mjx.put_model(self._mj_model, impl=self._config.impl)
         self._xml_path = config.model_path.as_posix()
@@ -301,6 +304,57 @@ class MjxKeyboardEnvV0(MjxMyoBase):
         self._key_finger = jp.asarray(np.array(assign), dtype=jp.int32)
         self._key_finger_np = np.array(assign)
         self._finger_home = jp.asarray(finger_home)
+
+    def _dataset_finger_map(self):
+        """{sanitized key name -> finger id (0-4 R thumb..pinky, 5-9 L)} from the
+        How-We-Type dataset (empirical_finger_map.json, argmax finger per key).
+        Same id convention as this env's tip order. None if unavailable."""
+        import json
+        from etils import epath
+        root = epath.Path(__file__).parent.parent.parent.parent.parent.parent
+        path = (root / "datasets/how_we_type/empirical_finger_map.json").as_posix()
+        try:
+            return {str(k): int(v) for k, v in json.load(open(path)).items()}
+        except Exception:
+            return None
+
+    def _assign_fingers_dataset(self, model):
+        """Override the geometric assignment with the DATASET's dominant finger per
+        key (human touch-typing), for keys present in the map whose finger exists on
+        this model (bimanual has all 10). Keys not in the data keep the geometric
+        nearest finger. Makes the finger CHOICE human-like, not just the effort."""
+        fmap = self._dataset_finger_map()
+        if fmap is None:
+            print("[finger assignment] empirical_finger_map.json missing; keeping geometric")
+            return
+        n_tips = len(self._tip_sids_np)
+        assign = np.array(self._key_finger_np).copy()
+        used = 0
+        for kid, kname in enumerate(self.key_names):
+            fid = fmap.get(kname)
+            if fid is not None and 0 <= fid < n_tips:
+                assign[kid] = fid
+                used += 1
+        self._key_finger = jp.asarray(assign, dtype=jp.int32)
+        self._key_finger_np = np.array(assign)
+        print(f"[finger assignment] DATASET: {used}/{len(self.key_names)} keys set "
+              f"from How-We-Type (rest geometric)")
+
+    def _report_finger_match(self):
+        """Print how human-like the current key->finger assignment is: the fraction
+        of (dataset-known) keys whose assigned finger equals the dataset's dominant
+        finger. Geometric ~ partial; dataset ~ 1.0. A build-time 'human-ness' gauge."""
+        fmap = self._dataset_finger_map()
+        if fmap is None:
+            return
+        hit = tot = 0
+        for kid, kname in enumerate(self.key_names):
+            if kname in fmap:
+                tot += 1
+                hit += int(int(self._key_finger_np[kid]) == fmap[kname])
+        if tot:
+            print(f"[finger match] assignment agrees with How-We-Type on "
+                  f"{hit}/{tot} keys ({100*hit/tot:.0f}%)")
 
     def _load_muscle_template(self):
         """Per-key HUMAN muscle template -> static (n_keys, na) target-activation
