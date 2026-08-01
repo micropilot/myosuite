@@ -66,6 +66,7 @@ class MjxKeyboardEnvV0(MjxMyoBase):
         self._bake_typing_posture(self._mj_model)  # sets self._init_qpos, stiffness
         self._assign_fingers_geometric(self._mj_model)  # sets self._key_finger, home
         self._finger_mode = str(self._config.get("finger_assignment", "geometric"))
+        self._finger_strict = bool(self._config.get("finger_strict", False))
         if self._finger_mode == "dataset":
             self._assign_fingers_dataset(self._mj_model)   # hard human argmax finger
         if self._finger_mode == "distribution":
@@ -682,6 +683,16 @@ class MjxKeyboardEnvV0(MjxMyoBase):
             ]))
         return jp.concatenate(slots)
 
+    def _pressing_finger_valid(self, data, info):
+        """(distribution-strict) True if the finger PHYSICALLY nearest to the target
+        key is a human-valid finger for it -- i.e. a human finger is the one actually
+        pressing. Used to ENFORCE (not just reward) human finger choice."""
+        key = self._target_key(info)
+        kp = data.site_xpos[self._key_site_ids[key]]
+        dists = jp.linalg.norm(data.site_xpos[self._tip_sids] - kp, axis=-1)
+        nearest = jp.argmin(dists)
+        return self._finger_valid[key][nearest] > 0.5
+
     def _seq_advance(self, data, info):
         """Debounced keystroke detection for the CURRENT sequence key: it counts
         as a completed keystroke when depressed past `press_th` by its assigned
@@ -693,6 +704,9 @@ class MjxKeyboardEnvV0(MjxMyoBase):
         advance = jp.logical_and(
             jp.logical_and(released_now, travel > self._press_th), on_key
         )
+        if self._finger_mode == "distribution" and self._finger_strict:
+            # only count the keystroke if a HUMAN finger is the one pressing.
+            advance = jp.logical_and(advance, self._pressing_finger_valid(data, info))
         return advance, released_now
 
     # ------------------------------------------------------------------ reset
