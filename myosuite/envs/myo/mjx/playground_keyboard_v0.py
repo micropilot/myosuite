@@ -71,6 +71,8 @@ class MjxKeyboardEnvV0(MjxMyoBase):
             self._assign_fingers_dataset(self._mj_model)   # hard human argmax finger
         if self._finger_mode == "distribution":
             self._load_finger_dist()                        # human finger DISTRIBUTION
+            if bool(self._config.get("finger_collision", False)):
+                self._apply_finger_collision(self._mj_model)  # PHYSICS enforcement
         self._report_finger_match()
 
         self._mjx_model = mjx.put_model(self._mj_model, impl=self._config.impl)
@@ -394,8 +396,41 @@ class MjxKeyboardEnvV0(MjxMyoBase):
                 valid[kid, int(prob[kid].argmax())] = 1.0
         self._finger_prob = jp.asarray(prob)
         self._finger_valid = jp.asarray(valid)
+        self._finger_valid_np = valid
         print(f"[finger distribution] loaded; avg {valid.sum(1).mean():.1f} plausible "
               f"fingers/key (prob>{thr})")
+
+    def _apply_finger_collision(self, model):
+        """PHYSICS enforcement of human finger choice: each key can be depressed ONLY
+        by its human-valid fingertips. Finger i -> collision bit i; fingertip geoms
+        broadcast on their finger bit; each key listens on the OR of its valid
+        fingers' bits. A non-human finger passes THROUGH the key (no contact) and so
+        physically cannot press it -> 100% human finger usage, no reward-gaming.
+        Overrides the uniform bit-4 filtering from _apply_contact_filtering."""
+        body_finger = {int(model.site_bodyid[model.site(s).id]): fi
+                       for fi, s in enumerate(self._tip_site_names)}
+        valid = self._finger_valid_np
+        for g in range(model.ngeom):
+            b = int(model.geom_bodyid[g])
+            if b in body_finger:                              # fingertip geom -> finger bit
+                model.geom_contype[g] = (1 << body_finger[b])
+                model.geom_conaffinity[g] = 0
+            nm = model.geom(g).name or ""
+            if nm.startswith("key_") and nm.endswith("_geom"):
+                k = nm[len("key_"):-len("_geom")]
+                if k in self.key_names:
+                    kid = self.key_names.index(k)
+                    mask = 0
+                    for fi in range(valid.shape[1]):
+                        if valid[kid, fi] > 0.5:
+                            mask |= (1 << fi)
+                    model.geom_contype[g] = 0
+                    model.geom_conaffinity[g] = int(mask)
+            if int(model.geom_type[g]) in (mujoco.mjtGeom.mjGEOM_ELLIPSOID,
+                                           mujoco.mjtGeom.mjGEOM_CYLINDER):
+                model.geom_contype[g] = 0; model.geom_conaffinity[g] = 0
+        print("[finger collision] PHYSICS enforcement: each key collidable only by "
+              "its human-valid fingertips")
 
     def _load_muscle_template(self):
         """Per-key HUMAN muscle template -> static (n_keys, na) target-activation

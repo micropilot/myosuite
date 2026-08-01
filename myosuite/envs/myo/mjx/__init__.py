@@ -59,6 +59,7 @@ keyboard_env_config = config_dict.ConfigDict({**base_config, **config_dict.creat
     finger_assignment="geometric",  # "geometric" | "dataset" (hard human argmax) | "distribution" (human finger dist)
     finger_valid_thresh=0.05,        # distribution mode: min human prob for a finger to be usable on a key
     finger_strict=False,             # distribution mode: only count a keystroke if a human finger is the presser
+    finger_collision=False,          # distribution mode: PHYSICS -- only human-valid fingertips can depress each key
     wrist_stiffness=8.0,   # passive stiffness holding the wrist pose
     naconmax_per_env=48,   # contact-buffer budget/env (broadphase candidates, pre-filter)
     target_keys=(),        # () -> every key on the board is targetable
@@ -256,6 +257,13 @@ keyboard_words_bimanual_shaped_dist_config["reward_config"]["finger_match_weight
 keyboard_words_bimanual_shaped_diststrict_config = copy.deepcopy(keyboard_words_bimanual_shaped_dist_config)
 keyboard_words_bimanual_shaped_diststrict_config["finger_strict"] = True
 
+# PHYSICS-enforced distribution: per-key collision filtering so ONLY the human-valid
+# fingertips can physically depress each key -> 100% human finger usage by physics
+# (no reward-gaming). The honest upper bound; typing pays the true cost of the human
+# finger constraint.
+keyboard_words_bimanual_shaped_distcol_config = copy.deepcopy(keyboard_words_bimanual_shaped_dist_config)
+keyboard_words_bimanual_shaped_distcol_config["finger_collision"] = True
+
 ppo_config = config_dict.create(
     num_timesteps=50_000_000,
     learning_rate=3e-4,
@@ -420,7 +428,9 @@ def make(env_name: str, config_overrides=None) -> mjx_env.MjxEnv:
     if "MjxKeyboard" in env_name_base:
         # NOTE: order matters (substring match) -> most specific names first.
         # (WordsBimanual before Bimanual, and both words names before the rest.)
-        if "WordsBimanualShapedDistStrict" in env_name_base:
+        if "WordsBimanualShapedDistCol" in env_name_base:
+            cfg = keyboard_words_bimanual_shaped_distcol_config
+        elif "WordsBimanualShapedDistStrict" in env_name_base:
             cfg = keyboard_words_bimanual_shaped_diststrict_config
         elif "WordsBimanualShapedDist" in env_name_base:
             cfg = keyboard_words_bimanual_shaped_dist_config
@@ -489,4 +499,5 @@ env_names = [
     "MjxKeyboardWordsBimanualShapedHF-v0",
     "MjxKeyboardWordsBimanualShapedDist-v0",
     "MjxKeyboardWordsBimanualShapedDistStrict-v0",
+    "MjxKeyboardWordsBimanualShapedDistCol-v0",
 ]
